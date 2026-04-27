@@ -1,0 +1,59 @@
+# ─── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ─── Virtualenvs e secrets ────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+.env
+.env.*
+!.env.example
+
+# ─── Jupyter ──────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ─── IDE / editores ───────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ─── Sistema operativo ────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+
+# ─── Claude Code (estado de sessão local) ─────────────────────────────────────
+.claude/
+
+# ─── Dados derivados — regeneráveis com prepare_data.py ───────────────────────
+data/train.csv
+data/test.csv
+
+# ─── Dados transformados — regeneráveis com apply_*.py ────────────────────────
+preparacao/*/transformed/*.csv
+
+# ─── Dados crus NASA C-MAPSS (descarregáveis) ─────────────────────────────────
+# Comenta as duas linhas abaixo se quiseres versionar os ficheiros crus.
+FD001_raw.csv
+FD001_train_timeseries.csv
+
+# ─── Logs e ficheiros temporários ─────────────────────────────────────────────
+*.log
+*.tmp
+*.bak
+*.md
+
+CLAUDE.md
