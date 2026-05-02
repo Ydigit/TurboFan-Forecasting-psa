@@ -1,18 +1,12 @@
 """
-Train all 3 x 3 x 4 = 36 combinations of (aggregation, differentiation, smoothing).
+Train all 3 x 3 x 4 = 36 combinations.
 
-Pipeline order per combo:  AGG  ->  DIFF  ->  SMOOTH
-  - aggregation:    applied to BOTH train and test (must match for the model)
-  - differentiation: applied to BOTH train and test (model expects diff inputs)
-  - smoothing:      applied to TRAIN only (user's choice)
+Pipeline (input is ALREADY scaled — data/train.csv, data/test.csv):
+  AGG  ->  DIFF  ->  SMOOTH (rolling mean, train only)
 
-Target = next-cycle sensor_11 at the chosen aggregation granularity.
-All transforms operate per-motor (no cross-engine leakage).
-
-GPU optimizations:
-  - whole tensors moved to GPU once
-  - manual batching with torch.randperm on GPU (no DataLoader overhead)
-  - bigger batch size (512)
+Smoothing = simple moving average with window k.  Train-only as per methodology.
+Aggregation re-aligns target via shift(-1) within each engine.
+Differentiation is k-th order diff per engine.
 
 Outputs:
   combinations/results.csv          full table (36 rows)
@@ -35,18 +29,20 @@ DATA_DIR  = PROJECT / "data"
 PLOTS_DIR = ROOT / "plots"
 PLOTS_DIR.mkdir(exist_ok=True)
 
-WINDOW = 10
-EPOCHS = 100
-BATCH  = 512
-LR     = 1e-3
-SEED   = 42
+WINDOW    = 10
+MIN_ITERS = 50_000             # spec do CLAUDE.md: > 50 000 iterações por combo
+BATCH     = 128                # match standalone convention
+LR        = 1e-3
+SEED      = 42
 
-AGGS    = [1, 3, 5]
-DIFFS   = [0, 1, 2]              # 0 = no diff
-SMOOTHS = [None, 0.1, 0.3, 0.5]  # None = no smoothing
+AGGS    = [1, 3, 5]                 # 1 = no agg
+DIFFS   = [0, 1, 2]                 # 0 = no diff
+SMOOTHS = [None, 3, 5, 7]           # None = no smoothing; otherwise rolling-mean window k
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}")
+if device.type == "cuda":
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
 
 train_raw = pd.read_csv(DATA_DIR / "train.csv")
 test_raw  = pd.read_csv(DATA_DIR / "test.csv")
@@ -54,70 +50,75 @@ scaler_y  = joblib.load(DATA_DIR / "scaler_y.pkl")
 scale     = float(scaler_y.scale_[0])
 
 
-# ── Transforms ───────────────────────────────────────────────────────────────
-def downsample(df: pd.DataFrame, N: int) -> pd.DataFrame:
-    """Average every N consecutive real cycles per motor; rebuild target + padding."""
+# ── Transforms (operate on already-scaled data) ──────────────────────────────
+def aggregate(df: pd.DataFrame, N: int) -> pd.DataFrame:
+    """Per engine: keep (N==1) or average every N consecutive REAL cycles. Recompute target via shift(-1)."""
     real = df[df["mask"] == 1].copy()
     rows = []
     for eid, grp in real.groupby("engine_id", sort=True):
         s = grp["sensor_11"].values
-        n_groups = len(s) // N
-        if n_groups < 2:
-            continue
-        agg = s[: n_groups * N].reshape(n_groups, N).mean(axis=1)
-        for i, val in enumerate(agg):
-            rows.append({"engine_id": int(eid), "sensor_11": float(val)})
+        if N == 1:
+            vals = s
+        else:
+            n_groups = len(s) // N
+            if n_groups < 2:
+                continue
+            vals = s[: n_groups * N].reshape(n_groups, N).mean(axis=1)
+        for v in vals:
+            rows.append({"engine_id": int(eid), "sensor_11": float(v)})
     out = pd.DataFrame(rows)
     out["target"] = out.groupby("engine_id")["sensor_11"].shift(-1)
-    out = out[out["target"].notna()].copy()
+    out = out[out["target"].notna()].copy().reset_index(drop=True)
+    return out
 
-    max_T = out.groupby("engine_id").size().max()
-    padded = []
-    for eid, grp in out.groupby("engine_id", sort=True):
-        grp = grp.reset_index(drop=True)
+
+def differentiate(df: pd.DataFrame, k: int) -> pd.DataFrame:
+    if k == 0:
+        return df
+    df = df.copy()
+    s = df.groupby("engine_id")["sensor_11"]
+    for _ in range(k):
+        s = s.diff(1)
+    df["sensor_11"] = s.fillna(0.0).values
+    return df
+
+
+def smooth_rolling(df: pd.DataFrame, k) -> pd.DataFrame:
+    """Rolling mean per engine on sensor_11. min_periods=1 so the head is not NaN."""
+    if k is None:
+        return df
+    df = df.copy()
+    s = df.groupby("engine_id")["sensor_11"].transform(
+        lambda x: x.rolling(window=int(k), min_periods=1).mean()
+    )
+    df["sensor_11"] = s.values
+    return df
+
+
+def pad_engines(df: pd.DataFrame) -> pd.DataFrame:
+    """Per-engine zero-pad to max_T. Adds mask column."""
+    max_T = df.groupby("engine_id").size().max()
+    out = []
+    for eid, grp in df.groupby("engine_id", sort=True):
+        grp = grp.copy().reset_index(drop=True)
         grp["mask"] = 1
         pad_len = max_T - len(grp)
         if pad_len > 0:
-            pad = pd.DataFrame({
+            p = pd.DataFrame({
                 "engine_id": eid, "sensor_11": 0.0, "target": 0.0, "mask": 0,
             }, index=range(pad_len))
-            grp = pd.concat([grp, pad], ignore_index=True)
-        padded.append(grp)
-    return pd.concat(padded, ignore_index=True)
-
-
-def transform(df: pd.DataFrame, agg_N: int, diff_order: int, alpha, apply_smooth: bool) -> pd.DataFrame:
-    df = df.copy()
-
-    if agg_N > 1:
-        df = downsample(df, agg_N)
-
-    real = df["mask"] == 1
-
-    if diff_order > 0:
-        d = df.loc[real].groupby("engine_id")["sensor_11"]
-        for _ in range(diff_order):
-            d = d.diff(1)
-        d = d.fillna(0.0)
-        df.loc[real, "sensor_11"] = d.values
-
-    if apply_smooth and alpha is not None:
-        s = df.loc[real].groupby("engine_id")["sensor_11"].transform(
-            lambda series: series.ewm(alpha=alpha, adjust=False).mean()
-        )
-        df.loc[real, "sensor_11"] = s.values
-
-    return df
+            grp = pd.concat([grp, p], ignore_index=True)
+        out.append(grp)
+    return pd.concat(out, ignore_index=True)
 
 
 def build_windows(df: pd.DataFrame):
     series = df["sensor_11"].values.astype(np.float32)
     target = df["target"].values.astype(np.float32)
     mask   = df["mask"].values.astype(np.float32)
-
     valid_t = np.where((mask[:-1] == 1) & (mask[1:] == 1))[0]
 
-    X_list, M_list, y_list = [], [], []
+    X, M, Y = [], [], []
     for t in valid_t:
         s = t - WINDOW + 1
         if s < 0:
@@ -126,9 +127,8 @@ def build_windows(df: pd.DataFrame):
             wm = np.concatenate([np.zeros(pad, dtype=np.float32), mask[0:t + 1]])
         else:
             wv = series[s:t + 1];  wm = mask[s:t + 1]
-        X_list.append(wv);  M_list.append(wm);  y_list.append(target[t])
-
-    return np.stack(X_list), np.stack(M_list), np.array(y_list, dtype=np.float32)
+        X.append(wv);  M.append(wm);  Y.append(target[t])
+    return np.stack(X), np.stack(M), np.array(Y, dtype=np.float32)
 
 
 # ── Model ─────────────────────────────────────────────────────────────────────
@@ -149,12 +149,15 @@ def train_one(X_tr, M_tr, y_tr, X_te, M_te, y_te):
     model = MLP().to(device)
     opt   = torch.optim.Adam(model.parameters(), lr=LR)
     crit  = nn.MSELoss()
-
     n = len(y_tr)
+    batches_per_epoch = max(1, (n + BATCH - 1) // BATCH)
+    epochs = max(1, (MIN_ITERS + batches_per_epoch - 1) // batches_per_epoch)
+    actual_iters = epochs * batches_per_epoch
+
     best_val = float("inf")
     best_state = None
 
-    for epoch in range(EPOCHS):
+    for _ in range(epochs):
         model.train()
         perm = torch.randperm(n, device=device)
         for i in range(0, n, BATCH):
@@ -163,7 +166,6 @@ def train_one(X_tr, M_tr, y_tr, X_te, M_te, y_te):
             loss = crit(model(X_tr[idx], M_tr[idx]), y_tr[idx])
             loss.backward()
             opt.step()
-
         model.eval()
         with torch.no_grad():
             val = crit(model(X_te, M_te), y_te).item()
@@ -180,67 +182,75 @@ def train_one(X_tr, M_tr, y_tr, X_te, M_te, y_te):
     ss_res = float(np.sum((y_np - pred) ** 2))
     ss_tot = float(np.sum((y_np - y_np.mean()) ** 2))
     r2     = 1.0 - ss_res / ss_tot
-    return rmse, r2
+    return rmse, r2, epochs, actual_iters
 
 
-# ── Main loop over 36 combos ─────────────────────────────────────────────────
+# ── Main loop ────────────────────────────────────────────────────────────────
 total = len(AGGS) * len(DIFFS) * len(SMOOTHS)
-print(f"\nRunning {total} combinations...\n")
+print(f"\nRunning {total} combinations (pipeline: AGG -> DIFF -> SMOOTH-train-only)...\n")
 results = []
 t_start = time.time()
 
 for agg in AGGS:
     for diff in DIFFS:
-        for smooth in SMOOTHS:
+        for k in SMOOTHS:
             t0 = time.time()
-            tr = transform(train_raw, agg, diff, smooth, apply_smooth=True)
-            te = transform(test_raw,  agg, diff, smooth, apply_smooth=False)
 
-            X_tr, M_tr, y_tr = build_windows(tr)
-            X_te, M_te, y_te = build_windows(te)
+            tr = aggregate(train_raw, agg)
+            te = aggregate(test_raw,  agg)
 
-            X_tr = torch.tensor(X_tr).to(device)
-            M_tr = torch.tensor(M_tr).to(device)
-            y_tr = torch.tensor(y_tr).to(device)
-            X_te = torch.tensor(X_te).to(device)
-            M_te = torch.tensor(M_te).to(device)
-            y_te = torch.tensor(y_te).to(device)
+            tr = differentiate(tr, diff)
+            te = differentiate(te, diff)
 
-            rmse, r2 = train_one(X_tr, M_tr, y_tr, X_te, M_te, y_te)
+            tr = smooth_rolling(tr, k)              # train only
+
+            tr_pad = pad_engines(tr)
+            te_pad = pad_engines(te)
+
+            X_tr, M_tr, y_tr = build_windows(tr_pad)
+            X_te, M_te, y_te = build_windows(te_pad)
+
+            X_tr = torch.tensor(X_tr).to(device); M_tr = torch.tensor(M_tr).to(device); y_tr = torch.tensor(y_tr).to(device)
+            X_te = torch.tensor(X_te).to(device); M_te = torch.tensor(M_te).to(device); y_te = torch.tensor(y_te).to(device)
+
+            rmse, r2, ep, iters = train_one(X_tr, M_tr, y_tr, X_te, M_te, y_te)
             elapsed = time.time() - t0
 
             results.append({
-                "agg": agg, "diff": diff, "smooth": str(smooth),
+                "agg": agg, "diff": diff, "smooth": str(k),
                 "rmse_scaled": rmse, "rmse_psia": rmse * scale,
                 "r2": r2, "n_test": int(len(y_te)), "elapsed_sec": elapsed,
+                "epochs": ep, "iters": iters,
             })
-            label = f"agg={agg} diff={diff} smooth={smooth}"
-            print(f"  [{len(results):2d}/{total}] {label:35s} RMSE={rmse:.4f}  R2={r2:.4f}  ({elapsed:.1f}s)")
+            label = f"agg={agg} diff={diff} smooth={k}"
+            print(f"  [{len(results):2d}/{total}] {label:35s} ep={ep:>5d} iter={iters:>6d}  RMSE_psia={rmse*scale:.4f}  R2={r2:.4f}  ({elapsed:.1f}s)")
 
 elapsed_total = time.time() - t_start
 print(f"\nTotal time: {elapsed_total:.1f}s")
 
+
 # ── Save table ───────────────────────────────────────────────────────────────
 df = pd.DataFrame(results)
-df_sorted = df.sort_values("rmse_scaled").reset_index(drop=True)
+df_sorted = df.sort_values("rmse_psia").reset_index(drop=True)
 df_sorted.to_csv(ROOT / "results.csv", index=False)
 print(f"\nSaved {ROOT / 'results.csv'}")
 
-print(f"\nTop 10 by RMSE (lower is better):")
-print(df_sorted[["agg", "diff", "smooth", "rmse_scaled", "rmse_psia", "r2"]].head(10).to_string(index=False))
+print(f"\nTop 10 by RMSE_psia (lower = melhor):")
+print(df_sorted[["agg", "diff", "smooth", "rmse_psia", "r2"]].head(10).to_string(index=False))
 
-print(f"\nTop 10 by R² (higher is better):")
-print(df.sort_values("r2", ascending=False)[["agg", "diff", "smooth", "rmse_scaled", "rmse_psia", "r2"]].head(10).to_string(index=False))
+print(f"\nTop 10 by R2 (maior = melhor):")
+print(df.sort_values("r2", ascending=False)[["agg", "diff", "smooth", "rmse_psia", "r2"]].head(10).to_string(index=False))
 
-# ── Plot top 15 by RMSE and by R² ────────────────────────────────────────────
+
+# ── Plot top 15 ──────────────────────────────────────────────────────────────
 fig, axes = plt.subplots(1, 2, figsize=(15, 7))
-top_rmse = df.sort_values("rmse_scaled").head(15)
+top_rmse = df.sort_values("rmse_psia").head(15)
 labels_r = [f"a{r['agg']} d{r['diff']} s{r['smooth']}" for _, r in top_rmse.iterrows()]
 axes[0].barh(labels_r[::-1], top_rmse["rmse_psia"].values[::-1], color="steelblue", alpha=0.85)
 for i, v in enumerate(top_rmse["rmse_psia"].values[::-1]):
     axes[0].text(v, i, f" {v:.4f}", va="center", fontsize=8)
 axes[0].set_xlabel("RMSE (psia)")
-axes[0].set_title("Top 15 — RMSE (menor = melhor)")
+axes[0].set_title("Top 15 - RMSE (menor = melhor)")
 axes[0].grid(True, alpha=0.3, axis="x")
 
 top_r2 = df.sort_values("r2", ascending=False).head(15)
@@ -248,15 +258,16 @@ labels_q = [f"a{r['agg']} d{r['diff']} s{r['smooth']}" for _, r in top_r2.iterro
 axes[1].barh(labels_q[::-1], top_r2["r2"].values[::-1], color="tomato", alpha=0.85)
 for i, v in enumerate(top_r2["r2"].values[::-1]):
     axes[1].text(v, i, f" {v:.4f}", va="center", fontsize=8)
-axes[1].set_xlabel("R²")
-axes[1].set_title("Top 15 — R² (maior = melhor)")
+axes[1].set_xlabel("R2")
+axes[1].set_title("Top 15 - R2 (maior = melhor)")
 axes[1].grid(True, alpha=0.3, axis="x")
 plt.tight_layout()
 plt.savefig(PLOTS_DIR / "01_top15.png", dpi=130);  plt.close()
 
-# ── Heatmaps: 3 painéis (1 por diff order), agg × smooth, color = R² ─────────
+
+# ── Heatmaps ─────────────────────────────────────────────────────────────────
 fig, axes = plt.subplots(1, 3, figsize=(15, 4.5), sharey=True)
-smooth_labels = ["none", "0.1", "0.3", "0.5"]
+smooth_labels = ["none", "k=3", "k=5", "k=7"]
 agg_labels    = ["1", "3", "5"]
 
 for ax, d in zip(axes, DIFFS):
@@ -268,14 +279,14 @@ for ax, d in zip(axes, DIFFS):
     im = ax.imshow(grid, cmap="RdYlGn", vmin=df["r2"].min(), vmax=df["r2"].max(), aspect="auto")
     ax.set_xticks(range(len(SMOOTHS)));  ax.set_xticklabels(smooth_labels)
     ax.set_yticks(range(len(AGGS)));     ax.set_yticklabels(agg_labels)
-    ax.set_xlabel("smoothing alpha");    ax.set_title(f"diff = {d}")
+    ax.set_xlabel("smoothing window");   ax.set_title(f"diff = {d}")
     for i in range(len(AGGS)):
         for j in range(len(SMOOTHS)):
             ax.text(j, i, f"{grid[i, j]:.3f}", ha="center", va="center", fontsize=8,
                     color="black" if grid[i, j] > 0.5 else "white")
 axes[0].set_ylabel("aggregation N")
-fig.suptitle("R² — agg × smooth, separado por diff order")
-fig.colorbar(im, ax=axes, fraction=0.02, pad=0.04, label="R²")
+fig.suptitle("R2 - agg x smooth, separado por diff order")
+fig.colorbar(im, ax=axes, fraction=0.02, pad=0.04, label="R2")
 plt.savefig(PLOTS_DIR / "02_heatmaps.png", dpi=130);  plt.close()
 
 print(f"\nPlots saved in {PLOTS_DIR}")

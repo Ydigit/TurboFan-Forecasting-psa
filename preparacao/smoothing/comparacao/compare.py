@@ -18,7 +18,7 @@ PROJECT       = ROOT.parent.parent.parent
 DATA_DIR      = PROJECT / "data"
 SMOOTH_TRAIN  = ROOT.parent / "treino"
 SMOOTH_TX     = ROOT.parent / "transformed"
-BASELINE_DIR  = PROJECT / "MLP" / "univariate" / "mask_baseline"
+BASELINE_DIR  = PROJECT / "Modeling" / "MLP" / "univariate" / "mask_baseline"
 PLOTS_DIR     = ROOT / "plots"
 PLOTS_DIR.mkdir(exist_ok=True)
 
