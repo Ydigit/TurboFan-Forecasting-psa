@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt
 import joblib
 
 ROOT       = Path(__file__).parent
-DATA_DIR   = ROOT.parent.parent / "data"
+DATA_DIR   = ROOT.parent.parent.parent / "data"
 MASK_DIR   = ROOT / "mask"
 NOMASK_DIR = ROOT / "no_mask"
 OUT_DIR    = ROOT / "comparison_plots"
@@ -83,7 +83,7 @@ err_nm = p_nomask - y_np
 
 # ── Unscale to sensor_11 original units (psia) using scaler_y ────────────────
 scaler_y = joblib.load(DATA_DIR / "scaler_y.pkl")
-scale = float(scaler_y.scale_[0])   # 1 standard deviation in original units
+scale = float(scaler_y.data_range_[0])   # MinMax: max - min of target in psia
 
 def metrics(err, label, unit_scale):
     mse  = float(np.mean(err ** 2))

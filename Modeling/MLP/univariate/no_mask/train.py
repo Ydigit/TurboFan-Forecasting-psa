@@ -13,7 +13,7 @@ from dataset import UnivariateEngineDataset, WINDOW
 from model   import UnivariateMLP
 
 ROOT      = Path(__file__).parent
-DATA_DIR  = ROOT.parent.parent.parent / "data"
+DATA_DIR  = ROOT.parent.parent.parent.parent / "data"
 PLOTS_DIR = ROOT / "plots"
 PLOTS_DIR.mkdir(exist_ok=True)
 

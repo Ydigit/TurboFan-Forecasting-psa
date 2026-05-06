@@ -25,7 +25,7 @@ WINDOW = 10
 ORDERS = [1, 2]
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 scaler_y = joblib.load(DATA_DIR / "scaler_y.pkl")
-scale = float(scaler_y.scale_[0])
+scale = float(scaler_y.data_range_[0])   # MinMax: max - min of target in psia
 
 
 def _load_model_class(folder: Path):

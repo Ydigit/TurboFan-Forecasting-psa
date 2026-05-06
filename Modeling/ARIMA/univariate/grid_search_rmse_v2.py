@@ -1,0 +1,192 @@
+"""
+ARIMA grid search by ROLLING-ORIGIN RMSE / R² — full (p, d, q) grid.
+
+For each ARIMA(p, d, q) with p, d, q in {0, 1, 2}:
+  - Rolling-origin 1-step-ahead forecast on test set
+  - Compute RMSE_psia, MAE_psia, R²
+
+27 combos total. Includes d=0 (no differencing — exposes non-stationarity)
+and d=2 (over-differencing — likely worse than d=1).
+
+Incremental save: writes results.csv after EACH combo so progress is never lost
+if interrupted.
+
+Outputs:
+  grid_search_rmse_v2_results.csv         full table
+  plots/grid_v2_rmse_heatmaps.png         3 panels (one per d): RMSE_psia
+  plots/grid_v2_r2_heatmaps.png           3 panels (one per d): R²
+  plots/grid_v2_top10_bars.png            top 10 by RMSE / R²
+"""
+
+import time
+import warnings
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import joblib
+import matplotlib.pyplot as plt
+from statsmodels.tsa.arima.model import ARIMA
+
+warnings.filterwarnings("ignore")
+
+ROOT      = Path(__file__).parent
+DATA_DIR  = ROOT.parent.parent.parent / "data"
+PLOTS_DIR = ROOT / "plots"
+PLOTS_DIR.mkdir(exist_ok=True)
+
+CSV_OUT = ROOT / "grid_search_rmse_v2_results.csv"
+
+WINDOW = 10
+P_RANGE = [0, 1, 2]
+D_RANGE = [0, 1, 2]
+Q_RANGE = [0, 1, 2]
+
+scaler_y = joblib.load(DATA_DIR / "scaler_y.pkl")
+scale    = float(scaler_y.data_range_[0])
+
+test_df = pd.read_csv(DATA_DIR / "test.csv")
+test_df = test_df[test_df["mask"] == 1].copy()
+print(f"Test rows: {len(test_df)} ({test_df['engine_id'].nunique()} engines)")
+print(f"Grid: {len(P_RANGE) * len(D_RANGE) * len(Q_RANGE)} (p,d,q) combos\n")
+
+
+def rolling_origin_one_order(order):
+    """Rolling-origin 1-step-ahead forecast for a given ARIMA order on the test set."""
+    t0 = time.time()
+    preds, actuals = [], []
+    n_failed = 0
+    for eid, grp in test_df.groupby("engine_id", sort=True):
+        series = grp["sensor_11"].values.astype(np.float64)
+        for t in range(WINDOW, len(series) - 1):
+            history = series[: t + 1]
+            try:
+                m = ARIMA(history, order=order).fit()
+                pred = float(m.forecast(steps=1)[0])
+                if not np.isfinite(pred):
+                    raise ValueError("non-finite forecast")
+            except Exception:
+                n_failed += 1
+                pred = float(history[-1])  # naive fallback
+            preds.append(pred)
+            actuals.append(float(series[t + 1]))
+    elapsed = time.time() - t0
+    preds = np.asarray(preds);  actuals = np.asarray(actuals)
+    err  = preds - actuals
+    rmse = float(np.sqrt(np.mean(err ** 2)))
+    mae  = float(np.mean(np.abs(err)))
+    ss_r = float(np.sum(err ** 2));  ss_t = float(np.sum((actuals - actuals.mean()) ** 2))
+    r2   = 1.0 - ss_r / ss_t
+    return rmse, mae, r2, len(preds), n_failed, elapsed
+
+
+# ── Resume-aware grid loop ──────────────────────────────────────────────────
+existing = pd.read_csv(CSV_OUT) if CSV_OUT.exists() else pd.DataFrame()
+done_keys = set()
+if len(existing):
+    done_keys = set(zip(existing["p"], existing["d"], existing["q"]))
+    print(f"Resuming: {len(done_keys)} combos already in {CSV_OUT.name}")
+
+results = existing.to_dict(orient="records") if len(existing) else []
+total = len(P_RANGE) * len(D_RANGE) * len(Q_RANGE)
+done = len(done_keys)
+t_start = time.time()
+
+for p in P_RANGE:
+    for d in D_RANGE:
+        for q in Q_RANGE:
+            if (p, d, q) in done_keys:
+                continue
+            done += 1
+            order = (p, d, q)
+            print(f"  [{done:>2d}/{total}] ARIMA({p},{d},{q})... ", end="", flush=True)
+            rmse, mae, r2, n_used, n_failed, elapsed = rolling_origin_one_order(order)
+            row = {
+                "p": p, "d": d, "q": q,
+                "n_params": p + q,
+                "rmse_scaled": rmse,
+                "rmse_psia":   rmse * scale,
+                "mae_psia":    mae * scale,
+                "r2":          r2,
+                "n":           n_used,
+                "n_failed":    n_failed,
+                "elapsed_sec": elapsed,
+            }
+            results.append(row)
+            # SAVE INCREMENTAL — never lose progress
+            pd.DataFrame(results).to_csv(CSV_OUT, index=False)
+            print(f"RMSE_psia={rmse*scale:.4f}  R2={r2:.4f}  ({elapsed/60:.1f} min)  failures={n_failed}")
+
+elapsed_total = time.time() - t_start
+print(f"\nTotal time (this run): {elapsed_total/60:.1f} min")
+
+df = pd.DataFrame(results)
+df.to_csv(CSV_OUT, index=False)
+
+# ── Top 5 ────────────────────────────────────────────────────────────────────
+print("\n=== Top 5 by RMSE_psia (lower = better) ===")
+print(df.sort_values("rmse_psia").head(5)[["p", "d", "q", "rmse_psia", "r2"]].to_string(index=False))
+
+print("\n=== Top 5 by R² (higher = better) ===")
+print(df.sort_values("r2", ascending=False).head(5)[["p", "d", "q", "rmse_psia", "r2"]].to_string(index=False))
+
+
+# ── Heatmaps: 3 panels per d ─────────────────────────────────────────────────
+def heatmaps(metric_col, title, lower_is_better, fname):
+    fig, axes = plt.subplots(1, len(D_RANGE), figsize=(5.5 * len(D_RANGE), 5), sharey=True)
+    if len(D_RANGE) == 1: axes = [axes]
+    for ax, d in zip(axes, D_RANGE):
+        grid = np.full((len(P_RANGE), len(Q_RANGE)), np.nan)
+        for r in results:
+            if r["d"] != d: continue
+            grid[P_RANGE.index(r["p"]), Q_RANGE.index(r["q"])] = r[metric_col]
+        cmap = "RdYlGn_r" if lower_is_better else "RdYlGn"
+        # use a global vmin/vmax for fair comparison across panels
+        all_vals = np.array([r[metric_col] for r in results])
+        im = ax.imshow(grid, cmap=cmap, aspect="auto",
+                       vmin=np.nanmin(all_vals), vmax=np.nanmax(all_vals))
+        ax.set_xticks(range(len(Q_RANGE)));  ax.set_xticklabels([f"q={q}" for q in Q_RANGE])
+        ax.set_yticks(range(len(P_RANGE)));  ax.set_yticklabels([f"p={p}" for p in P_RANGE])
+        ax.set_xlabel("MA (q)"); ax.set_ylabel("AR (p)")
+        ax.set_title(f"d={d}")
+        for i in range(len(P_RANGE)):
+            for j in range(len(Q_RANGE)):
+                v = grid[i, j]
+                if not np.isnan(v):
+                    ax.text(j, i, f"{v:.4f}", ha="center", va="center", fontsize=9)
+    fig.suptitle(title, fontsize=12)
+    fig.colorbar(im, ax=axes, fraction=0.025, pad=0.04, label=metric_col)
+    plt.savefig(PLOTS_DIR / fname, dpi=130);  plt.close()
+
+
+heatmaps("rmse_psia",
+         "ARIMA grid — RMSE_psia (rolling-origin on test, lower = better)",
+         lower_is_better=True,
+         fname="grid_v2_rmse_heatmaps.png")
+heatmaps("r2",
+         "ARIMA grid — R² (rolling-origin on test, higher = better)",
+         lower_is_better=False,
+         fname="grid_v2_r2_heatmaps.png")
+
+
+# ── Top 10 bars ──────────────────────────────────────────────────────────────
+fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+top_rmse = df.sort_values("rmse_psia").head(10)
+labels_r = [f"({r['p']},{r['d']},{r['q']})" for _, r in top_rmse.iterrows()]
+axes[0].barh(labels_r[::-1], top_rmse["rmse_psia"].values[::-1], color="steelblue", alpha=0.85)
+for i, v in enumerate(top_rmse["rmse_psia"].values[::-1]):
+    axes[0].text(v, i, f" {v:.4f}", va="center", fontsize=9)
+axes[0].set_xlabel("RMSE (psia)");  axes[0].set_title("Top 10 by RMSE (lower = better)")
+axes[0].grid(True, alpha=0.3, axis="x")
+
+top_r2 = df.sort_values("r2", ascending=False).head(10)
+labels_q = [f"({r['p']},{r['d']},{r['q']})" for _, r in top_r2.iterrows()]
+axes[1].barh(labels_q[::-1], top_r2["r2"].values[::-1], color="tomato", alpha=0.85)
+for i, v in enumerate(top_r2["r2"].values[::-1]):
+    axes[1].text(v, i, f" {v:.4f}", va="center", fontsize=9)
+axes[1].set_xlabel("R²");  axes[1].set_title("Top 10 by R² (higher = better)")
+axes[1].grid(True, alpha=0.3, axis="x")
+plt.tight_layout()
+plt.savefig(PLOTS_DIR / "grid_v2_top10_bars.png", dpi=130);  plt.close()
+
+print(f"\nResults: {CSV_OUT}")
+print(f"Plots:   {PLOTS_DIR}")

@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import MinMaxScaler
 import joblib
 
 TRAIN_RATIO = 0.80
@@ -38,12 +38,12 @@ test_df  = df[df["engine_id"].isin(test_engines)].copy()
 # ── Scale features + target (fit on train real cycles only) ──────────────────
 train_real = train_df  # all rows before padding are real
 
-scaler_X = StandardScaler()
+scaler_X = MinMaxScaler()
 train_df[feature_cols] = scaler_X.fit_transform(train_df[feature_cols])
 test_df[feature_cols]  = scaler_X.transform(test_df[feature_cols])
 joblib.dump(scaler_X, DATA_DIR / "scaler_X.pkl")
 
-scaler_y = StandardScaler()
+scaler_y = MinMaxScaler()
 train_df[["target"]] = scaler_y.fit_transform(train_df[["target"]])
 test_df[["target"]]  = scaler_y.transform(test_df[["target"]])
 joblib.dump(scaler_y, DATA_DIR / "scaler_y.pkl")

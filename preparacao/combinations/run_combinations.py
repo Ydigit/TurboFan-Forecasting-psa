@@ -47,7 +47,7 @@ if device.type == "cuda":
 train_raw = pd.read_csv(DATA_DIR / "train.csv")
 test_raw  = pd.read_csv(DATA_DIR / "test.csv")
 scaler_y  = joblib.load(DATA_DIR / "scaler_y.pkl")
-scale     = float(scaler_y.scale_[0])
+scale     = float(scaler_y.data_range_[0])   # MinMax: max - min of target in psia
 
 
 # ── Transforms (operate on already-scaled data) ──────────────────────────────
